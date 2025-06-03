@@ -6,7 +6,8 @@
 // --- Configuração dos sensores e atuadores ---
 const int pinTCRT5000 = 3; // Sensor óptico na roda (interrupção)
 volatile unsigned long pulseCount = 0;
-unsigned long lastPulseTime = 0;
+volatile unsigned long lastPulseTime = 0;
+volatile unsigned long lastPulseInterval = 0; // NOVO: tempo entre pulsos em ms
 
 const int pinESC = 9; // PWM para ESC do motor
 int pwmValue = 120;   // Valor inicial de PWM (ajuste conforme necessário)
@@ -25,9 +26,12 @@ float getVehicleSpeedFromMPU() {
 }
 
 // --- Interrupção para contar pulsos do TCRT5000 ---
-void IRAM_ATTR onPulse() {
+void onPulse() {
+  unsigned long now = millis();
+  lastPulseInterval = now - lastPulseTime; // NOVO: calcula intervalo desde o último pulso
+  lastPulseTime = now;
   pulseCount++;
-  lastPulseTime = millis();
+  Serial.println("Pulso detectado!"); // DEBUG: Mostra quando um pulso é detectado
 }
 
 // --- Pinos RC Receiver ---
@@ -46,10 +50,16 @@ bool autonomousMode = false;
 // --- MCP2515 CAN ---
 const int CAN_CS_PIN = 8;
 MCP_CAN CAN(CAN_CS_PIN);
+bool canAvailable = false; // NOVO: flag para indicar se CAN está disponível
 
 // --- Variáveis para comandos CAN ---
 int can_esc_pwm = 120;
 int can_servo_angle = 90;
+
+// --- Variáveis globais para obstáculos e CAN ---
+bool obstacleDetected = false;
+bool lastObstacleState = false;
+#define CAN_OBS_ID 0x300 // Defina um ID CAN para mensagem de obstáculo
 
 // --- Inicialização ---
 void setup(){ 
@@ -59,91 +69,157 @@ void setup(){
   
   pinMode(pinTCRT5000, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(pinTCRT5000), onPulse, FALLING);
+  Serial.print("TCRT5000 digitalRead: ");
+  Serial.println(digitalRead(pinTCRT5000));
 
   pinMode(pinESC, OUTPUT);
   analogWrite(pinESC, pwmValue);
 
-  pinMode(trigPin, OUTPUT);
-  pinMode(echoPin, INPUT);
+  // Inicialização condicional dos sensores e atuadores opcionais
+  #ifdef HAS_ULTRASONIC
+    pinMode(trigPin, OUTPUT);
+    pinMode(echoPin, INPUT);
+  #endif
 
-  pinMode(pinRC_CH1, INPUT);
-  pinMode(pinRC_CH2, INPUT);
-  pinMode(pinRC_CH3, INPUT);
-  pinMode(pinRC_CH4, INPUT);
-  pinMode(pinServo, OUTPUT);
-  servoDirecao.attach(pinServo);
+  #ifdef HAS_RC
+    pinMode(pinRC_CH1, INPUT);
+    pinMode(pinRC_CH2, INPUT);
+    pinMode(pinRC_CH3, INPUT);
+    pinMode(pinRC_CH4, INPUT);
+    pinMode(pinServo, OUTPUT);
+    servoDirecao.attach(pinServo);
+  #endif
 
   Serial.begin(115200);
 
   // Inicialização CAN
   if (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
     Serial.println("CAN BUS OK!");
+    canAvailable = true;
+    CAN.setMode(MCP_NORMAL);
   } else {
     Serial.println("CAN BUS FAIL!");
-    while (1);
+    canAvailable = false;
+    // Não trava o loop, apenas desabilita CAN
   }
-  CAN.setMode(MCP_NORMAL);
 }
 
-// --- Função para calcular velocidade da roda ---
+// --- Função para calcular velocidade da roda e imprimir RPM ---
 float getWheelSpeed() {
   static unsigned long lastCheck = 0;
   static unsigned long lastCount = 0;
+  static float lastSpeed = 0.0;
+  static float lastRPM = 0.0;
   unsigned long now = millis();
-  float speed = 0.0;
-  if (now - lastCheck >= 100) { // a cada 100ms
+  float speed = lastSpeed;
+  float rpm = lastRPM;
+  if (now - lastCheck >= 100) {
     unsigned long deltaCount = pulseCount - lastCount;
-    // Supondo 1 pulso por volta, ajuste conforme encoder
-    float wheelCircumference = 0.21; // metros (ajuste conforme roda)
-    speed = (deltaCount * wheelCircumference * 10); // m/s (10x por segundo)
+    float wheelCircumference = 0.21; // metros
+    float deltaTime = (now - lastCheck) / 1000.0; // segundos
+
+    // NOVO: calcula RPM usando o intervalo do último pulso se houver pulso novo
+    if (deltaCount > 0 && lastPulseInterval > 0) {
+      rpm = 60000.0 / lastPulseInterval; // 1 pulso por volta, 60000 ms/min
+      speed = (rpm * wheelCircumference) / 60.0; // m/s
+      lastSpeed = speed;
+      lastRPM = rpm;
+      Serial.print("lastPulseInterval: ");
+      Serial.print(lastPulseInterval);
+      Serial.print(" ms, RPM: ");
+      Serial.println(rpm, 2);
+    } else if (deltaCount > 0 && deltaTime > 0) {
+      // fallback para cálculo antigo
+      rpm = (deltaCount / deltaTime) * 60.0;
+      speed = (rpm * wheelCircumference) / 60.0;
+      lastSpeed = speed;
+      lastRPM = rpm;
+      Serial.print("deltaCount: ");
+      Serial.print(deltaCount);
+      Serial.print(" deltaTime: ");
+      Serial.print(deltaTime, 4);
+      Serial.print(" RPM: ");
+      Serial.println(rpm, 2);
+    }
     lastCount = pulseCount;
     lastCheck = now;
   }
   return speed;
 }
 
-// --- Função para ler distância do HC-SR04 ---
+// --- Funções que dependem de hardware opcional ---
+// Use checagens para evitar travamentos se o hardware não estiver presente
+
 float readUltrasonic() {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  long duration = pulseIn(echoPin, HIGH, 20000); // timeout 20ms
-  float distance = duration * 0.034 / 2.0; // cm
-  return distance;
+  #ifdef HAS_ULTRASONIC
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    long duration = pulseIn(echoPin, HIGH, 20000); // timeout 20ms
+    float distance = duration * 0.034 / 2.0; // cm
+    return distance;
+  #else
+    return 999; // valor alto = sem obstáculo
+  #endif
 }
 
-// --- Controle de tração e segurança ---
-void tractionControl() {
+void processCAN() {
+  if (!canAvailable) return;
+  long unsigned int rxId;
+  unsigned char len = 0;
+  unsigned char rxBuf[8];
+  if (CAN.checkReceive() == CAN_MSGAVAIL) {
+    CAN.readMsgBuf(&rxId, &len, rxBuf);
+    // Exemplo: ID 0x100 = controle motor/servo
+    if (rxId == 0x100 && len >= 2) {
+      can_esc_pwm = rxBuf[0];      // PWM do ESC (0-255)
+      can_servo_angle = rxBuf[1];  // Ângulo do servo (0-180)
+      Serial.print("CAN RX: ESC="); Serial.print(can_esc_pwm);
+      Serial.print(" SERVO="); Serial.println(can_servo_angle);
+    }
+  }
+}
+
+void sendNavigationDataCAN() {
+  if (!canAvailable) return;
+  // Exemplo: envia wheelSpeed (2 bytes), pulseCount (2 bytes), slip (1 byte * 100)
   float wheelSpeed = getWheelSpeed();
-  float vehicleSpeed = getVehicleSpeedFromMPU();
+  unsigned int wheelSpeedInt = (unsigned int)(wheelSpeed * 100); // 2 bytes
+  unsigned int pulseCountInt = (unsigned int)(pulseCount & 0xFFFF); // 2 bytes
   float slip = 0.0;
+  float vehicleSpeed = getVehicleSpeedFromMPU();
   if (vehicleSpeed > 0.1) {
     slip = (wheelSpeed - vehicleSpeed) / vehicleSpeed;
   }
-  // Se slip > 20%, reduzir PWM do motor
-  if (slip > 0.2) {
-    pwmValue = max(pwmValue - 5, 90); // reduz PWM, mínimo 90
-    analogWrite(pinESC, pwmValue);
-    Serial.println("Slip detectado! Reduzindo PWM.");
-  } else if (slip < 0.05 && pwmValue < 150) {
-    pwmValue = min(pwmValue + 1, 150); // aumenta PWM devagar
-    analogWrite(pinESC, pwmValue);
-  }
-  Serial.print("WheelSpeed: "); Serial.print(wheelSpeed);
-  Serial.print(" VehicleSpeed: "); Serial.print(vehicleSpeed);
-  Serial.print(" Slip: "); Serial.println(slip);
+  int slipInt = (int)(slip * 100); // 1 byte
+
+  unsigned char navData[5];
+  navData[0] = (wheelSpeedInt >> 8) & 0xFF;
+  navData[1] = wheelSpeedInt & 0xFF;
+  navData[2] = (pulseCountInt >> 8) & 0xFF;
+  navData[3] = pulseCountInt & 0xFF;
+  navData[4] = (char)slipInt;
+
+  CAN.sendMsgBuf(0x200, 0, 5, navData);
 }
 
-// --- Parada automática por obstáculo ---
-#define CAN_OBS_ID 0x300  // ID para mensagem de obstáculo
-
-bool obstacleDetected = false;
-bool lastObstacleState = false;
+#define CAN_HEARTBEAT_ID 0x400
+unsigned long lastHeartbeat = 0;
+void sendHeartbeatCAN() {
+  if (!canAvailable) return;
+  unsigned char data[1] = {0xAA}; // valor arbitrário
+  CAN.sendMsgBuf(CAN_HEARTBEAT_ID, 0, 1, data);
+}
 
 void safetyStop() {
-  float dist = readUltrasonic();
+  float dist = 9999;
+  #ifdef trigPin
+  if (digitalPinToInterrupt(trigPin) >= 0) {
+    dist = readUltrasonic();
+  }
+  #endif
   if (dist > 0 && dist < 20) { // obstáculo a menos de 20cm
     obstacleDetected = true;
     analogWrite(pinESC, 0); // para o motor
@@ -153,7 +229,7 @@ void safetyStop() {
   }
 
   // Envia mensagem CAN para o Raspberry Pi se houver mudança de estado do obstáculo
-  if (autonomousMode && (obstacleDetected != lastObstacleState)) {
+  if (canAvailable && autonomousMode && (obstacleDetected != lastObstacleState)) {
     unsigned char obsData[1];
     obsData[0] = obstacleDetected ? 1 : 0;
     CAN.sendMsgBuf(CAN_OBS_ID, 0, 1, obsData);
@@ -162,11 +238,12 @@ void safetyStop() {
 }
 
 void readSensorAndControlLed() {
-  if (digitalRead(pinSensor) == LOW){ // se for LOW 
-        digitalWrite(pinLed, HIGH); // acende o led
-  }else{ // caso contrário
-        digitalWrite(pinLed, LOW); // apaga o led
-  }    
+  // LED mais rápido e mais forte (HIGH = 5V, sem delay extra)
+  if (digitalRead(pinSensor) == LOW) {
+    digitalWrite(pinLed, HIGH); // acende o led
+  } else {
+    digitalWrite(pinLed, LOW); // apaga o led
+  }
 }
 
 // --- Função para ler PWM RC (pulseIn) ---
@@ -204,94 +281,34 @@ void manualControl() {
   }
 }
 
-void processCAN() {
-  long unsigned int rxId;
-  unsigned char len = 0;
-  unsigned char rxBuf[8];
-  if (CAN.checkReceive() == CAN_MSGAVAIL) {
-    CAN.readMsgBuf(&rxId, &len, rxBuf);
-    // Exemplo: ID 0x100 = controle motor/servo
-    if (rxId == 0x100 && len >= 2) {
-      can_esc_pwm = rxBuf[0];      // PWM do ESC (0-255)
-      can_servo_angle = rxBuf[1];  // Ângulo do servo (0-180)
-      Serial.print("CAN RX: ESC="); Serial.print(can_esc_pwm);
-      Serial.print(" SERVO="); Serial.println(can_servo_angle);
-    }
-  }
-}
-
-void autonomousControl() {
-  processCAN();
-  servoDirecao.write(can_servo_angle);
-  // Permite ré (can_esc_pwm < 90) mesmo com obstáculo detectado
-  if (!obstacleDetected || can_esc_pwm < 90) {
-    if (tractionControlEnabled) {
-      tractionControl();
-    } else {
-      analogWrite(pinESC, can_esc_pwm);
-    }
-  } else {
-    analogWrite(pinESC, 0); // mantém motor parado
-  }
-}
-
-unsigned long lastCanNavSend = 0;
-
-// --- Envio dos dados de navegação via CAN ---
-void sendNavigationDataCAN() {
-  // Exemplo: envia wheelSpeed (2 bytes), pulseCount (2 bytes), slip (1 byte * 100)
-  float wheelSpeed = getWheelSpeed();
-  unsigned int wheelSpeedInt = (unsigned int)(wheelSpeed * 100); // 2 bytes
-  unsigned int pulseCountInt = (unsigned int)(pulseCount & 0xFFFF); // 2 bytes
-  float slip = 0.0;
-  float vehicleSpeed = getVehicleSpeedFromMPU();
-  if (vehicleSpeed > 0.1) {
-    slip = (wheelSpeed - vehicleSpeed) / vehicleSpeed;
-  }
-  int slipInt = (int)(slip * 100); // 1 byte
-
-  unsigned char navData[5];
-  navData[0] = (wheelSpeedInt >> 8) & 0xFF;
-  navData[1] = wheelSpeedInt & 0xFF;
-  navData[2] = (pulseCountInt >> 8) & 0xFF;
-  navData[3] = pulseCountInt & 0xFF;
-  navData[4] = (char)slipInt;
-
-  CAN.sendMsgBuf(0x200, 0, 5, navData);
-}
-
-#define CAN_HEARTBEAT_ID 0x400
-unsigned long lastHeartbeat = 0;
-void sendHeartbeatCAN() {
-  unsigned char data[1] = {0xAA}; // valor arbitrário
-  CAN.sendMsgBuf(CAN_HEARTBEAT_ID, 0, 1, data);
-}
-
+// --- Função stub para diagnóstico de sensores ---
 void checkSensorHealth() {
-  static unsigned long lastPulse = 0;
-  if (millis() - lastPulseTime > 1000) {
-    // Falha no encoder (sem pulsos recentes)
-    digitalWrite(pinLed, HIGH); // pisca LED como alerta
-  }
-  // Adicionar lógica para outros sensores se necessário
+  // TODO: Implementar diagnóstico real dos sensores
+  // Por enquanto, apenas imprime mensagem de diagnóstico
+  //Serial.println("Sensor health check: OK");
 }
 
 void loop(){
   updateModes();
+
+  // Só executa controles se os pinos existem
+  #if defined(pinRC_CH1) && defined(pinRC_CH2) && defined(pinServo)
   if (autonomousMode) {
     autonomousControl();
   } else {
     manualControl();
-    if (millis() - lastCanNavSend > 100) {
+    if (canAvailable && millis() - lastCanNavSend > 100) {
       sendNavigationDataCAN();
       lastCanNavSend = millis();
     }
   }
+  #endif
+
   safetyStop();
   readSensorAndControlLed();
 
   // [NOVO] Heartbeat CAN
-  if (millis() - lastHeartbeat > 500) {
+  if (canAvailable && millis() - lastHeartbeat > 500) {
     sendHeartbeatCAN();
     lastHeartbeat = millis();
   }
@@ -299,5 +316,24 @@ void loop(){
   // [NOVO] Diagnóstico de sensores
   checkSensorHealth();
 
-  delay(50); // ajuste conforme necessário
+  // DEBUG: Mostra o valor do pino do sensor para ajudar no diagnóstico
+  // Só imprime se pulso detectado ou valor do sensor mudou
+  static int lastTcrtValue = -1;
+  int tcrtValue = digitalRead(pinTCRT5000);
+  if (tcrtValue != lastTcrtValue) {
+    Serial.print("TCRT5000 raw: ");
+    Serial.println(tcrtValue);
+    lastTcrtValue = tcrtValue;
+  }
+  static unsigned long lastPulseCount = 0;
+  if (pulseCount != lastPulseCount) {
+    Serial.print("pulseCount: ");
+    Serial.println(pulseCount);
+    lastPulseCount = pulseCount;
+  }
+
+  getWheelSpeed();
+
+  // Remove o delay(50) para resposta mais rápida do LED e cálculo de RPM
+  // delay(50); // ajuste conforme necessário
 }
